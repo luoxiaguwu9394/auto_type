@@ -1,0 +1,5 @@
+# Agent working data (session state, memory)
+.workbuddy/
+
+# Upstream clone of mattpocock/skills (nested git repo, kept only for updates)
+mattpocock-skills/
