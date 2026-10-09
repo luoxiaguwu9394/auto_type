@@ -3,3 +3,10 @@
 
 # Upstream clone of mattpocock/skills (nested git repo, kept only for updates)
 mattpocock-skills/
+
+# 本地配置：节奏参数每人一套，不入库
+config.json
+
+# Python 缓存
+__pycache__/
+*.pyc
