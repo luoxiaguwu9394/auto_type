@@ -4,12 +4,14 @@
 两者都是纯边界，不需要真的敲键盘。测试名用 GLOSSARY.md 的术语：语料、笔画、回退、节奏。
 """
 
+import io
 import json
 import random
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -355,6 +357,81 @@ class TestConfigPersistence(unittest.TestCase):
         self.assertEqual(saved.countdown, 10)
 
 
+class TestOutputEncoding(unittest.TestCase):
+    """控制台编不出的字符不该把命令行整个带崩。"""
+
+    def test_unencodable_character_degrades_instead_of_raising(self):
+        # 管道/文件重定向时 Python 按系统本地编码写，简中即 GBK
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="gbk")
+        with patch.object(sys, "stdout", stream), patch.object(sys, "stderr", stream):
+            auto_type.ensure_safe_encoding()
+            print("emoji 😀 生僻字 𠮷 回车 ⏎")
+            sys.stdout.flush()
+
+    def test_safe_encoding_leaves_working_streams_alone(self):
+        """能正常写就别动它——reconfigure 会重置缓冲，不该无条件调用。"""
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+        with patch.object(sys, "stdout", stream):
+            auto_type.ensure_safe_encoding()
+            print("中文 😀")
+            sys.stdout.flush()
+        self.assertEqual(stream.buffer.getvalue().decode("utf-8").strip(), "中文 😀")
+
+
+class TestDecodeText(unittest.TestCase):
+    """Windows 上管道里的子进程输出按系统本地编码写，工具链得能认出来。"""
+
+    def test_decodes_gb18030_control_output(self):
+        raw = "干跑：预计耗时 9 秒".encode("gb18030")
+        self.assertEqual(auto_type.decode_text(raw), "干跑：预计耗时 9 秒")
+
+    def test_prefers_utf8_when_both_would_pass(self):
+        raw = "纯 ASCII 的输出".encode("utf-8")
+        self.assertEqual(auto_type.decode_text(raw), "纯 ASCII 的输出")
+
+    def test_raises_when_nothing_matches(self):
+        with self.assertRaises(auto_type.PayloadError):
+            auto_type.decode_text(b"\xff\xfe\x00", candidates=("utf-8",))
+
+
+class TestFrozenPaths(unittest.TestCase):
+    """打包成 exe 之后 config.json 的落点。
+
+    onefile 模式下 `__file__` 指向 %TEMP%\\_MEIxxxxxx——那个目录每次启动重新解压、
+    退出即删。要是还照着它写配置，参数记忆会彻底失效，所以冻结后必须认 exe 所在目录。
+    """
+
+    def test_config_sits_next_to_the_exe_when_frozen(self):
+        with patch.object(sys, "frozen", True, create=True), patch.object(
+            sys, "executable", r"C:\somewhere\auto_type.exe"
+        ):
+            self.assertEqual(auto_type.config_path(), Path(r"C:\somewhere") / "config.json")
+
+    def test_config_sits_next_to_the_script_when_not_frozen(self):
+        with patch.object(sys, "frozen", False, create=True):
+            self.assertEqual(
+                auto_type.config_path(),
+                Path(auto_type.__file__).resolve().parent / "config.json",
+            )
+
+    def test_console_shim_is_a_noop_without_freezing(self):
+        """没打包时别碰 stdout，否则测试和源码运行都会被改坏。"""
+        original = sys.stdout
+        with patch.object(auto_type, "is_frozen", return_value=False):
+            auto_type.ensure_console()
+        self.assertIs(sys.stdout, original)
+
+    def test_console_shim_keeps_print_alive_when_no_console_attaches(self):
+        """windowed 打包且没有父控制台时，print() 必须还能跑。"""
+        with patch.object(auto_type, "is_frozen", return_value=True), patch.object(
+            auto_type, "_attach_parent_console", return_value=None
+        ), patch.object(sys, "stdout", None), patch.object(sys, "stderr", None):
+            auto_type.ensure_console()
+            print("这行不该抛异常")
+            self.assertIsInstance(sys.stdout, auto_type.NullWriter)
+            self.assertIsInstance(sys.stderr, auto_type.NullWriter)
+
+
 class TestDryRun(unittest.TestCase):
     def test_dry_run_sends_no_keystrokes(self):
         config = auto_type.Config(
@@ -389,6 +466,19 @@ class TestDryRun(unittest.TestCase):
         summary = auto_type.format_dry_run(payload, strokes, config)
         self.assertIn("预计耗时", summary)
         self.assertIn(auto_type.format_duration(auto_type.estimate_seconds(strokes)), summary)
+
+    def test_summary_survives_a_gbk_console(self):
+        """简中 Windows 上重定向输出按 GBK 写，干跑预览里不能出现 GBK 编不出的符号。
+
+        ⏎ (U+23CE) 和 ⌫ (U+232B) 都不在 GBK 里——一个字符就能让整条命令抛
+        UnicodeEncodeError 崩掉，而且只在预览窗口恰好套到回车/退格时才复现。
+        """
+        config = auto_type.Config(
+            dry_run=True, countdown=0, humanize=False, delay_min=1, delay_max=1
+        )
+        payload = "ab\ncd"
+        strokes = auto_type.build_plan(payload, config, rng=random.Random(0))
+        auto_type.format_dry_run(payload, strokes, config).encode("gbk")
 
     def test_estimate_seconds_matches_total_waits(self):
         config = auto_type.Config(humanize=False, delay_min=10, delay_max=10)

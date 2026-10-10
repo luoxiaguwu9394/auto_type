@@ -10,3 +10,8 @@ config.json
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 打包产物与中间文件（build.py 生成，不入库）
+build/
+dist/
+*.spec

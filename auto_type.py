@@ -8,7 +8,9 @@
     python auto_type.py --file 文档.txt      # 命令行
     python auto_type.py --file 文档.txt --dry-run
 
-# TODO(roadmap): 支持打包成独立 exe（PyInstaller 一行命令，等内核稳定后再加）
+打包成独立 exe 的用法（见 PACKAGING.md）：
+    auto_type.exe                           # 图形界面
+    auto_type.exe --file 文档.txt            # 命令行，输出接回 cmd 的控制台
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Sequence, TextIO
 
 # 图形界面是可选的：没有 tkinter 的 Python 照样能用命令行
 try:
@@ -37,8 +39,74 @@ except ImportError:  # pragma: no cover - 取决于解释器有没有带 tkinter
     tk = ttk = filedialog = messagebox = None
     HAS_TK = False
 
+__version__ = "1.0.0"
+
 LARGE_PAYLOAD_THRESHOLD = 50_000
 CONFIG_FILENAME = "config.json"
+
+# 自动识别时的候选编码，顺序即优先级。简中 Windows 上文件与管道输出
+# 两大主力就是 UTF-8 和 GB18030（向下兼容 GBK）。
+AUTO_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030")
+
+
+# ─────────────────────────────────────────────────────────── 冻结（打包）适配层
+
+
+def is_frozen() -> bool:
+    """是不是跑在打包后的 exe 里。PyInstaller 会把 sys.frozen 设成真值。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+class NullWriter:
+    """没有控制台时顶替 sys.stdout / sys.stderr，免得 print() 抛 AttributeError。"""
+
+    def write(self, _text: str) -> int:
+        return 0
+
+    def flush(self) -> None:
+        pass
+
+
+def _attach_parent_console() -> tuple[TextIO, TextIO] | None:
+    """把本进程的 stdout/stderr 接回父进程的控制台。
+
+    只在从 cmd / PowerShell 启动时成立；双击启动时没有父控制台，返回 None。
+    """
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if not kernel32.AttachConsole(-1):  # ATTACH_PARENT_PROCESS
+            return None
+        stdout = open("CONOUT$", "w", encoding="utf-8", buffering=1, errors="replace")
+        stderr = open("CONOUT$", "w", encoding="utf-8", buffering=1, errors="replace")
+        return stdout, stderr
+    except OSError:
+        return None
+
+
+def ensure_safe_encoding() -> None:
+    """让 stdout / stderr 碰到编不出的字符时降级，而不是把整条命令带崩。
+
+    重定向到文件或管道时，Python 按系统本地编码写（简中即 GBK）；emoji、生僻字、
+    `⏎` 这类符号都不在 GBK 里，一个字符就能抛 UnicodeEncodeError 让命令行整个失败。
+    换成替换写法：宁可当场少显示一个字符，也别让命令白跑一趟。
+    （真正的语料一个字符都不会受影响——它走的是按键通道，不经过控制台。）
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+def ensure_console() -> None:
+    """windowed 打包后 sys.stdout / sys.stderr 是 None，任何 print() 都会崩。
+
+    能接上父控制台就接（从 cmd 运行时命令行输出照常可见）；接不上就换成
+    丢弃写入的替身（双击启动，用户本来就看不到控制台，只求别崩）。
+    """
+    if not is_frozen() or (sys.stdout is not None and sys.stderr is not None):
+        return
+    sys.stdout, sys.stderr = _attach_parent_console() or (NullWriter(), NullWriter())
 
 # ────────────────────────────────────────────────────────────── Win32 适配层
 
@@ -192,8 +260,20 @@ class Config:
         return cls(**{k: v for k, v in data.items() if k in known})
 
 
+def config_dir() -> Path:
+    """config.json 放哪个目录。
+
+    打包成 exe 之后不能再用 `__file__`：onefile 模式下它指向 %TEMP%\\_MEIxxxxxx，
+    那是每次启动重新解压、退出即删的临时目录，配置写进去等于没写。
+    冻结后认 exe 自己所在的目录，行为跟源码形态"配置与程序同目录"保持一致。
+    """
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def config_path() -> Path:
-    return Path(__file__).resolve().parent / CONFIG_FILENAME
+    return config_dir() / CONFIG_FILENAME
 
 
 def load_config() -> Config:
@@ -232,6 +312,20 @@ class PayloadError(Exception):
     """语料读不出来，或者认不出编码。"""
 
 
+def decode_text(raw: bytes, candidates: Sequence[str] = AUTO_ENCODINGS) -> str:
+    """按候选顺序试解一段字节，全试不通就抛 PayloadError。空字节返回空串。
+
+    读语料要用它，打包工具链读 exe 的控制台输出也要用它——Windows 上管道里的
+    输出按系统本地编码写（简中即 GB18030），写死 utf-8 会直接解不出来。
+    """
+    for enc in candidates:
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    raise PayloadError(f"认不出这段字节的编码，试过 {', '.join(candidates)}")
+
+
 def load_payload(path: str | Path, encoding: str | None = "auto") -> str:
     source = Path(path)
     try:
@@ -239,19 +333,14 @@ def load_payload(path: str | Path, encoding: str | None = "auto") -> str:
     except OSError as exc:
         raise PayloadError(f"读不到语料文件：{source}（{exc}）") from exc
 
-    if encoding in (None, "", "auto"):
-        candidates = ["utf-8-sig", "utf-8", "gb18030"]
-    else:
-        candidates = [encoding]
-
-    for enc in candidates:
-        try:
-            return raw.decode(enc)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    raise PayloadError(
-        f"认不出 {source} 的编码，试过 {', '.join(candidates)}；在图形界面的编码下拉框里手动指定"
-    )
+    candidates = AUTO_ENCODINGS if encoding in (None, "", "auto") else (encoding,)
+    try:
+        return decode_text(raw, candidates)
+    except PayloadError:
+        raise PayloadError(
+            f"认不出 {source} 的编码，试过 {', '.join(candidates)}；"
+            "在图形界面的编码下拉框里手动指定"
+        ) from None
 
 
 # ────────────────────────────────────────────────────────── 语料 → 笔画序列
@@ -433,7 +522,10 @@ def format_dry_run(payload: str, strokes: Sequence[Stroke], config: Config) -> s
         lines.append("")
         lines.append("前几笔：")
         for stroke in preview:
-            label = {"char": stroke.text, "enter": "⏎", "backspace": "⌫"}.get(stroke.kind, "?")
+            # 标签用 ASCII：⏎ / ⌫ 不在 GBK 里，简中 Windows 上一重定向就整个崩
+            label = {"char": stroke.text, "enter": "<Enter>", "backspace": "<Backspace>"}.get(
+                stroke.kind, "?"
+            )
             lines.append(f"  等 {stroke.wait_ms:.0f} ms → {label}")
     return "\n".join(lines)
 
@@ -458,6 +550,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="只打印计划，不真发按键")
     parser.add_argument("--yes", action="store_true", help="超长语料也不再确认")
     parser.add_argument("--gui", action="store_true", help="打开图形界面")
+    parser.add_argument("--version", action="version", version=f"auto_type {__version__}")
     return parser
 
 
@@ -798,6 +891,10 @@ def launch_gui() -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # windowed 打包后 stdout/stderr 是 None，先接上控制台再让任何 print 有机会执行
+    ensure_console()
+    # 再把编码兜住：简中 Windows 上管道里是 GBK，编不出的字符不该崩掉整条命令
+    ensure_safe_encoding()
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:
         launch_gui()
