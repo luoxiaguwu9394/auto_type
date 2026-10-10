@@ -81,12 +81,18 @@ def build_zip(zip_path: Path) -> int:
 
 
 def write_sums(entries: list[tuple[str, Path]]) -> Path:
-    """写 SHA256SUMS.txt：`<hash>  <name>`，按文件名升序。"""
+    """写 SHA256SUMS.txt：`<hash>  <name>`，按文件名升序。
+
+    必须用 LF 换行：GNU `sha256sum -c` 会把行尾的 `\\r` 当成文件名的一部分，
+    CRLF 会让它去找一个叫 `xxx.zip\\r` 的文件而报 "FAILED open or read"。
+    `Path.write_text` 在 Windows 上默认按文本模式把 `\\n` 翻成 `\\r\\n`，
+    所以这里显式传 `newline="\\n"` 关闭该转换。
+    """
     sums_path = RELEASE_DIR / "SHA256SUMS.txt"
     lines = []
     for name, path in sorted(entries, key=lambda item: item[0]):
         lines.append(f"{sha256_of(path)}  {name}")
-    sums_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    sums_path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     return sums_path
 
 
