@@ -1,0 +1,4 @@
+第一行：中文测试，带全角标点，。
+Second line: English with punctuation, and a comma.
+第三行：emoji 😀🎉 与增补字符 𠮷，用来验 UTF-16 代理对。
+第四行：1234567890 !@#$%^&*()

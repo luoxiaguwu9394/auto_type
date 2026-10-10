@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>auto_type 测试靶场</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    font-family: "Microsoft YaHei", -apple-system, "Segoe UI", sans-serif;
+    margin: 0; padding: 28px 32px; background: #f7f7f5; color: #1f2328; line-height: 1.6;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .hint { color: #57606a; font-size: 13px; margin: 0 0 22px; }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; }
+  .card {
+    flex: 1 1 340px; background: #fff; border: 1px solid #d8dce1; border-radius: 8px;
+    padding: 16px 18px; box-shadow: 0 1px 2px rgba(31,35,40,.05);
+  }
+  .card h2 { font-size: 15px; margin: 0 0 2px; }
+  .card .sub { font-size: 12px; color: #6e7781; margin: 0 0 12px; }
+  .card.blocked { border-color: #d0a35c; background: #fffdf7; }
+  input, textarea {
+    width: 100%; box-sizing: border-box; font-size: 14px; padding: 8px 10px;
+    border: 1px solid #c6ccd4; border-radius: 6px; background: #fff; color: #1f2328;
+    font-family: Consolas, "Microsoft YaHei", monospace;
+  }
+  textarea { min-height: 108px; resize: vertical; }
+  input:focus, textarea:focus { outline: 2px solid #4a8fe7; outline-offset: -1px; border-color: #4a8fe7; }
+  .stats { margin-top: 10px; font-size: 12px; color: #57606a; display: flex; gap: 14px; flex-wrap: wrap; }
+  .stats b { color: #1f2328; font-weight: 600; }
+  .flash { margin-top: 8px; font-size: 12px; min-height: 18px; color: #b45309; }
+  button {
+    margin-top: 22px; font-size: 13px; padding: 7px 16px; border-radius: 6px;
+    border: 1px solid #c6ccd4; background: #fff; cursor: pointer;
+  }
+  button:hover { background: #f3f4f6; }
+  ol { font-size: 13px; color: #3d444d; max-width: 760px; }
+  code { background: #eef0f2; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>auto_type 测试靶场</h1>
+<p class="hint">左边是普通输入框（对照），右边把粘贴路径全部堵死。计数区能证明字是真的"敲"进去的：粘贴不产生 keydown。</p>
+
+<div class="row">
+  <div class="card">
+    <h2>对照：普通输入框</h2>
+    <p class="sub">粘贴随便用，用来对比 L2 与 L3 的差异</p>
+    <input id="plain" type="text" placeholder="光标放这里，可以粘贴">
+    <div class="stats" id="stats-plain"></div>
+    <div class="flash" id="flash-plain"></div>
+  </div>
+
+  <div class="card blocked">
+    <h2>禁粘贴：单行输入框</h2>
+    <p class="sub">paste / copy / cut / drop / 右键 / Ctrl+V / Shift+Insert 全部拦截</p>
+    <input id="locked" type="text" placeholder="粘不进来，只能一个字一个字敲">
+    <div class="stats" id="stats-locked"></div>
+    <div class="flash" id="flash-locked"></div>
+  </div>
+
+  <div class="card blocked">
+    <h2>禁粘贴：多行文本框</h2>
+    <p class="sub">同上，用来验换行和长文本</p>
+    <textarea id="lockedArea" placeholder="粘不进来，只能一个字一个字敲"></textarea>
+    <div class="stats" id="stats-lockedArea"></div>
+    <div class="flash" id="flash-lockedArea"></div>
+  </div>
+</div>
+
+<button id="clear">清空全部</button>
+
+<h2 style="font-size:15px;margin:26px 0 6px">怎么测</h2>
+<ol>
+  <li>先在「对照」框里按 Ctrl+V 粘一段，确认这个页面本身粘贴是通的（计数里的 <b>拦截</b> 保持 0）。</li>
+  <li>再在右边「禁粘贴」框里按 Ctrl+V——应该<b>什么都粘不进来</b>，拦截计数 +1。</li>
+  <li>光标点进「禁粘贴」框，切到命令行跑 <code>python auto_type.py --file sample.txt --countdown 5</code>。</li>
+  <li>回来数：<b>字数</b> 要等于语料字符数，<b>keydown</b> 要跟上去（证明是真实按键事件，不是塞值）。</li>
+</ol>
+
+<script>
+  var fields = {};
+
+  function setup(id, locked) {
+    var el = document.getElementById(id);
+    var state = { el: el, locked: locked, blocked: 0, keydown: 0, input: 0,
+                  stats: document.getElementById('stats-' + id),
+                  flash: document.getElementById('flash-' + id) };
+    fields[id] = state;
+
+    el.addEventListener('keydown', function (e) {
+      state.keydown++;
+      if (!locked) { render(state); return; }
+      var k = (e.key || '').toLowerCase();
+      var combo = (e.ctrlKey || e.metaKey) && (k === 'v' || k === 'c' || k === 'x' || k === 'a');
+      var insert = (e.shiftKey && e.key === 'Insert') || (e.ctrlKey && e.key === 'Insert');
+      if (combo || insert) {
+        e.preventDefault();
+        state.blocked++;
+        state.flash.textContent = '已拦截：' + (e.key === 'Insert' ? 'Insert' : 'Ctrl+' + k.toUpperCase());
+        clearTimeout(state.timer);
+        state.timer = setTimeout(function () { state.flash.textContent = ''; }, 1600);
+      }
+      render(state);
+    });
+
+    el.addEventListener('input', function () { state.input++; render(state); });
+
+    if (locked) {
+      ['paste', 'copy', 'cut', 'drop', 'contextmenu', 'dragover'].forEach(function (name) {
+        el.addEventListener(name, function (e) { e.preventDefault(); state.blocked++; render(state); });
+      });
+    }
+    render(state);
+  }
+
+  function render(state) {
+    state.stats.innerHTML =
+      '字数 <b>' + state.el.value.length + '</b>' +
+      '　keydown <b>' + state.keydown + '</b>' +
+      '　input <b>' + state.input + '</b>' +
+      '　拦截 <b>' + state.blocked + '</b>';
+  }
+
+  setup('plain', false);
+  setup('locked', true);
+  setup('lockedArea', true);
+
+  document.getElementById('clear').addEventListener('click', function () {
+    Object.keys(fields).forEach(function (id) {
+      var s = fields[id];
+      s.el.value = ''; s.blocked = 0; s.keydown = 0; s.input = 0;
+      s.flash.textContent = ''; render(s);
+    });
+  });
+</script>
+
+</body>
+</html>

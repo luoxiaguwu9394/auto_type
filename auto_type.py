@@ -99,11 +99,24 @@ user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
 user32.GetAsyncKeyState.restype = ctypes.c_short
 
 
+class InjectionError(Exception):
+    """按键没能送进系统输入队列。"""
+
+
 def _send_inputs(inputs: Sequence[INPUT]) -> None:
     array = (INPUT * len(inputs))(*inputs)
     sent = user32.SendInput(len(inputs), array, ctypes.sizeof(INPUT))
     if sent != len(inputs):
-        raise ctypes.WinError(ctypes.get_last_error())
+        code = ctypes.get_last_error()
+        if code == 5:  # ERROR_ACCESS_DENIED，UIPI 拦下来的典型症状
+            raise InjectionError(
+                "系统拒绝了这次按键注入（权限不足）。最常见的原因：目标程序是「以管理员身份运行」的，"
+                "而敲字的这一方不是。把两边跑在同一权限级别再试。"
+            )
+        raise InjectionError(
+            f"按键注入失败，只发出 {sent}/{len(inputs)} 个事件"
+            f"（Windows 错误 {code}：{ctypes.FormatError(code)}）"
+        )
 
 
 def utf16_units(ch: str) -> list[int]:
@@ -112,13 +125,15 @@ def utf16_units(ch: str) -> list[int]:
     return [encoded[i] | (encoded[i + 1] << 8) for i in range(0, len(encoded), 2)]
 
 
-def send_unicode_unit(unit: int) -> None:
-    down = INPUT(INPUT_KEYBOARD, _INPUTUNION(ki=KEYBDINPUT(0, unit, KEYEVENTF_UNICODE, 0, 0)))
-    up = INPUT(
-        INPUT_KEYBOARD,
-        _INPUTUNION(ki=KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)),
-    )
-    _send_inputs([down, up])
+def _unicode_inputs(unit: int) -> list[INPUT]:
+    """一个 UTF-16 码元的按下 + 抬起。"""
+    return [
+        INPUT(INPUT_KEYBOARD, _INPUTUNION(ki=KEYBDINPUT(0, unit, KEYEVENTF_UNICODE, 0, 0))),
+        INPUT(
+            INPUT_KEYBOARD,
+            _INPUTUNION(ki=KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)),
+        ),
+    ]
 
 
 def send_virtual_key(vk: int) -> None:
@@ -130,8 +145,12 @@ def send_virtual_key(vk: int) -> None:
 def send_stroke(stroke: "Stroke") -> None:
     if stroke.kind == "char":
         # TODO(roadmap): 超长语料可在这里改走剪贴板加速（Ctrl+V），需先探测目标是否吃粘贴
+        # 一个字符的所有码元放进一次 SendInput：分两次发会留缝，
+        # 输入法或目标自己可能插进来，增补字符的代理对就拼坏了
+        inputs: list[INPUT] = []
         for unit in utf16_units(stroke.text):
-            send_unicode_unit(unit)
+            inputs.extend(_unicode_inputs(unit))
+        _send_inputs(inputs)
     elif stroke.kind == "enter":
         send_virtual_key(VK_RETURN)
     elif stroke.kind == "backspace":
@@ -185,12 +204,22 @@ def load_config() -> Config:
         return Config()
 
 
+def sanitise_for_persistence(config: Config) -> Config:
+    """有两样东西不能按原样写进配置，否则一次操作会永久改变行为：
+
+    - 干跑是一次性动作。写进去的话，下次打开界面会莫名其妙停在"不真敲"。
+    - 倒计时是安全缓冲（留给你把焦点切到目标）。一次 `--countdown 0` 要是存下来，
+      之后每次都立刻开敲，字会敲到当前窗口身上。配置里不落 0。
+      真想永久关掉，手工改 config.json——那是明确的、只对本地生效的选择。
+    """
+    return replace(config, dry_run=False, countdown=max(config.countdown, 1.0))
+
+
 def save_config(config: Config) -> None:
-    # 干跑是一次性动作，不进配置：否则下次打开界面会莫名停在"不真敲"
-    persisted = replace(config, dry_run=False)
     try:
         config_path().write_text(
-            json.dumps(persisted.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(sanitise_for_persistence(config).to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
     except OSError:
         pass
@@ -266,6 +295,15 @@ def build_plan(payload: str, config: Config, rng: random.Random | None = None) -
 
         actual = " " if ch == "\n" else ch
         strokes.append(Stroke("char", actual, _char_wait(config, rng)))
+
+        # 增补字符（emoji、生僻字）占两个 UTF-16 码元，而 recent 是按"字"计数的。
+        # 目标端一个退格未必删得掉整个字——只删一半时，我们对"目标里现在有什么"的认知就错了，
+        # 之后每退一次错位就放大一次，表现就是删错位置、把字打成了邻居字。
+        # 所以把它当成同步屏障：屏障前的不再参与回退，它自己也不回退。
+        if len(utf16_units(actual)) > 1:
+            recent.clear()
+            continue
+
         recent.append(actual)
 
         if config.humanize and rng.random() < config.retract_probability:
@@ -379,6 +417,8 @@ def execute_plan(
 
 
 def format_dry_run(payload: str, strokes: Sequence[Stroke], config: Config) -> str:
+    # 先归一化再统计，否则 CRLF 会让"字符数"比真正敲出去的多（一个 \r 是不发的）
+    payload = payload.replace("\r\n", "\n").replace("\r", "\n")
     backspaces = sum(1 for s in strokes if s.kind == "backspace")
     lines = [
         "干跑：下面只是计划，一个按键都不会真的发出去",
@@ -474,14 +514,19 @@ def run_cli(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     def on_status(message: str) -> None:
         print(f"\r{message}          ", flush=True)
 
-    result = execute_plan(
-        strokes,
-        config,
-        total_chars=len(payload),
-        on_progress=on_progress,
-        on_status=on_status,
-        should_abort=is_escape_pressed,
-    )
+    try:
+        result = execute_plan(
+            strokes,
+            config,
+            total_chars=len(payload),
+            on_progress=on_progress,
+            on_status=on_status,
+            should_abort=is_escape_pressed,
+        )
+    except InjectionError as exc:
+        print()
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
     print()
     print("已中止" if result.aborted else "敲完了")
     return 0
