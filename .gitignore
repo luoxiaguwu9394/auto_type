@@ -15,3 +15,6 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# GitHub Release 分发包（tools/make_release.py 生成，约 29 MB，不入库）
+release/

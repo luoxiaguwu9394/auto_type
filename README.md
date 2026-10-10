@@ -17,19 +17,25 @@
 
 **方式一：直接用打包好的 exe**（不需要装 Python）
 
-```cmd
-dist\auto_type\auto_type.exe                    :: 图形界面（日常推荐，启动 277 ms）
-dist\auto_type\auto_type.exe --file 语料.txt     :: 命令行
-dist\auto_type.exe                              :: 单文件便携版（启动约 3 秒，适合发给别人）
-```
+从 [Releases](https://github.com/luoxiaguwu9394/auto_type/releases) 下载分发包：
 
-自己在本地打包（详见 [PACKAGING.md](./PACKAGING.md)）：
+| 下载 | 适合 | 启动 |
+| --- | --- | --- |
+| `auto_type-1.0.0-windows-x64.zip` | 解压后运行 `auto_type\auto_type.exe`，日常用 | 约 0.3 秒 |
+| `auto_type-1.0.0-windows-x64-portable.exe` | 单个文件，不用解压，适合发给别人 | 约 3 秒 |
+
+完整性校验值在同页的 `SHA256SUMS.txt`。
+
+想自己构建（详见 [PACKAGING.md](./PACKAGING.md)）：
 
 ```bash
-python build.py --onefile     # 出 onedir + onefile 两个产物到 dist/
+python build.py --onefile        # 出 onedir + onefile 两个产物到 dist/
+python tools/make_release.py     # 再打成可分发到 Release 的包 → release/
 ```
 
 > 打包必须用**带 tkinter 的 Python**（官方安装包装的都有），本机是 `C:\Python314\python.exe`。`build.py` 会先检查，缺了直接报错。
+>
+> exe 未签名，首次运行可能有 SmartScreen 提示（「更多信息 → 仍要运行」），部分杀软也可能误报。发布包已关掉 UPX 压缩来降低这个概率。
 
 **方式二：源码运行**（零第三方依赖，Windows + Python 3.10+ 即可）
 
